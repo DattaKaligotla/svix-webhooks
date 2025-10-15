@@ -1,0 +1,136 @@
+# syntax=docker/dockerfile:1
+# 
+# Development Dockerfile for Svix Webhooks project
+# This provides a development environment with hot reloading and debugging capabilities
+#
+# Build with: docker build -f Dockerfile.dev -t svix-dev .
+
+FROM docker.io/rust:1.89-slim-trixie AS development
+
+SHELL ["/bin/bash", "-eux", "-o", "pipefail", "-c"]
+
+# Install development dependencies
+RUN --mount=target=/var/lib/apt/lists,type=cache,sharing=locked --mount=target=/var/cache/apt,type=cache,sharing=locked <<EOF
+    export DEBIAN_FRONTEND=noninteractive
+    apt-get update -q
+    apt-get install -y \
+        build-essential=12.* \
+        checkinstall=1.* \
+        zlib1g-dev=1:* \
+        pkg-config=1.8.* \
+        libssl-dev=* \
+        curl=8.* \
+        cmake=3.* \
+        git=1:* \
+        ca-certificates=20250419 \
+        libssl3t64=3.* \
+        jq=1.* \
+        postgresql-client=15+* \
+        redis-tools=6:* \
+        --no-install-recommends
+    update-ca-certificates
+EOF
+
+# Install development tools
+RUN cargo install cargo-watch cargo-edit sqlx-cli --locked
+
+# Create app user with proper permissions
+RUN <<EOF
+    mkdir -p /app
+    useradd -m -s /bin/bash appuser
+    chown -R appuser: /app
+    # Add appuser to sudo group (for development convenience)
+    apt-get update && apt-get install -y sudo
+    usermod -aG sudo appuser
+    echo 'appuser ALL=(ALL) NOPASSWD:ALL' >> /etc/sudoers
+EOF
+
+# Set up Rust environment for the user
+USER appuser
+ENV PATH="/home/appuser/.cargo/bin:${PATH}"
+
+# Pre-compile common dependencies for faster builds
+WORKDIR /tmp/deps
+COPY --chown=appuser:appuser Cargo.toml Cargo.lock ./
+COPY --chown=appuser:appuser server/Cargo.toml server/
+COPY --chown=appuser:appuser bridge/Cargo.toml bridge/Cargo.lock bridge/
+COPY --chown=appuser:appuser svix-cli/Cargo.toml svix-cli/Cargo.lock svix-cli/
+
+# Create dummy source files to build dependencies
+RUN mkdir -p server/src bridge/src svix-cli/src && \
+    echo 'fn main() {}' > server/src/main.rs && \
+    echo 'fn main() {}' > bridge/src/main.rs && \
+    echo 'fn main() {}' > svix-cli/src/main.rs
+
+# Build dependencies (this will be cached)
+RUN cd server && cargo build --release
+RUN cd bridge && cargo build --release  
+RUN cd svix-cli && cargo build --release
+
+# Clean up dummy files
+RUN rm -rf /tmp/deps
+
+WORKDIR /app
+
+# Install additional development utilities
+RUN cargo install --locked \
+    bacon \
+    cargo-nextest \
+    cargo-audit \
+    cargo-outdated
+
+# Create helpful aliases and development scripts
+RUN <<EOF
+cat >> /home/appuser/.bashrc << 'BASHRC'
+
+# Svix development aliases
+alias ll='ls -la'
+alias la='ls -A'
+alias l='ls -CF'
+alias server='cd /app/server && cargo run --bin svix-server'
+alias bridge='cd /app/bridge && cargo run --bin svix-bridge'
+alias cli='cd /app/svix-cli && cargo run --bin svix'
+alias test-server='cd /app/server && cargo test'
+alias test-all='cd /app && cargo test --workspace'
+alias fmt='cargo fmt --all'
+alias check='cargo check --workspace'
+alias clippy='cargo clippy --workspace -- -D warnings'
+
+# Helpful functions
+svix-jwt() {
+    cargo run --bin svix-server -- jwt generate "$@"
+}
+
+svix-migrate() {
+    cargo run --bin svix-server -- --run-migrations
+}
+
+# Environment
+export RUST_BACKTRACE=1
+export CARGO_INCREMENTAL=1
+
+echo "🦀 Svix Development Environment Ready!"
+echo "Useful commands:"
+echo "  server     - Run Svix server"
+echo "  bridge     - Run Svix bridge" 
+echo "  cli        - Run Svix CLI"
+echo "  test-all   - Run all tests"
+echo "  fmt        - Format code"
+echo "  check      - Check code"
+echo "  clippy     - Run clippy linter"
+echo ""
+echo "Current directory: \$(pwd)"
+
+BASHRC
+EOF
+
+# Set up development environment
+ENV RUST_BACKTRACE=full
+ENV CARGO_INCREMENTAL=1
+ENV RUSTFLAGS="-C incremental=/tmp/incremental"
+
+# Expose common development ports
+EXPOSE 8071 5000 9229
+
+# Default command for development
+CMD ["/bin/bash"]

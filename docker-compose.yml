@@ -1,0 +1,234 @@
+version: "3.8"
+
+networks:
+  svix-network:
+    driver: bridge
+
+volumes:
+  postgres-data:
+    driver: local
+  redis-data:
+    driver: local
+
+services:
+  # PostgreSQL Database
+  postgres:
+    image: "docker.io/postgres:13.4"
+    container_name: svix-postgres
+    networks:
+      - svix-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    volumes:
+      - "postgres-data:/var/lib/postgresql/data/"
+    environment:
+      POSTGRES_DB: svix
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_INITDB_ARGS: "--auth-host=scram-sha-256 --auth-local=scram-sha-256"
+    ports:
+      - "5432:5432"
+
+  # PgBouncer Connection Pooler
+  pgbouncer:
+    image: "docker.io/edoburu/pgbouncer:1.15.0"
+    container_name: svix-pgbouncer
+    networks:
+      - svix-network
+    healthcheck:
+      test: "pg_isready -h localhost -p 6432"
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    environment:
+      DB_HOST: postgres
+      DB_USER: postgres
+      DB_PASSWORD: postgres
+      DB_NAME: svix
+      POOL_MODE: transaction
+      MAX_CLIENT_CONN: 500
+      DEFAULT_POOL_SIZE: 100
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Redis Cache and Queue
+  redis:
+    image: "docker.io/redis:7-alpine"
+    container_name: svix-redis
+    networks:
+      - svix-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    # Enable persistence and configure memory
+    command: >
+      --save 60 500
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 512mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - "redis-data:/data"
+    ports:
+      - "6379:6379"
+
+  # Main Svix Server
+  svix-server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prod
+    image: svix/svix-complete:latest
+    container_name: svix-server
+    networks:
+      - svix-network
+    healthcheck:
+      test: ["CMD-SHELL", "svix-server healthcheck http://localhost:8071"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    environment:
+      # Database Configuration
+      SVIX_DB_DSN: "postgresql://postgres:postgres@pgbouncer:6432/svix"
+      
+      # Redis Configuration
+      SVIX_REDIS_DSN: "redis://redis:6379"
+      SVIX_QUEUE_TYPE: "redis"
+      
+      # JWT Configuration (CHANGE THIS IN PRODUCTION!)
+      SVIX_JWT_SECRET: "your-super-secret-jwt-key-change-in-production"
+      
+      # Server Configuration
+      SVIX_LOG_LEVEL: "info"
+      SVIX_LOG_FORMAT: "json"
+      
+      # Wait for dependencies
+      WAIT_FOR: "true"
+      
+      # Optional: Whitelist internal networks for development
+      SVIX_WHITELIST_SUBNETS: '["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "127.0.0.0/8"]'
+      
+      # Performance tuning
+      SVIX_DB_POOL_MAX_SIZE: "100"
+      SVIX_REDIS_POOL_MAX_SIZE: "100"
+    ports:
+      - "8071:8071"
+    depends_on:
+      pgbouncer:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+          cpus: '1.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  # Svix Bridge (Optional - for integrating with external systems)
+  svix-bridge:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: prod
+    image: svix/svix-complete:latest
+    container_name: svix-bridge
+    networks:
+      - svix-network
+    command: ["svix-bridge"]
+    environment:
+      SVIX_BRIDGE_CFG: "/app/svix-bridge.yaml"
+    volumes:
+      - "./bridge/svix-bridge.example.senders.yaml:/app/svix-bridge.yaml:ro"
+    ports:
+      - "5000:5000"
+    depends_on:
+      svix-server:
+        condition: service_healthy
+    restart: unless-stopped
+    profiles:
+      - bridge
+
+  # Monitoring and Management Tools
+  
+  # Redis Admin UI (Optional)
+  redis-commander:
+    image: docker.io/rediscommander/redis-commander:latest
+    container_name: svix-redis-ui
+    networks:
+      - svix-network
+    environment:
+      REDIS_HOSTS: "local:redis:6379"
+      HTTP_USER: admin
+      HTTP_PASSWORD: admin
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis:
+        condition: service_healthy
+    profiles:
+      - monitoring
+
+  # PostgreSQL Admin UI (Optional)
+  pgadmin:
+    image: docker.io/dpage/pgadmin4:latest
+    container_name: svix-pgadmin
+    networks:
+      - svix-network
+    environment:
+      PGADMIN_DEFAULT_EMAIL: admin@svix.local
+      PGADMIN_DEFAULT_PASSWORD: admin
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "8080:80"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles:
+      - monitoring
+
+  # Webhook Testing Service
+  webhook-tester:
+    image: docker.io/tarampampam/webhook-tester:latest
+    container_name: svix-webhook-tester
+    networks:
+      - svix-network
+    ports:
+      - "8082:8080"
+    profiles:
+      - testing
+
+# Example usage commands (these are not run by default):
+# 
+# Start core services:
+#   docker compose up -d
+# 
+# Start with monitoring tools:
+#   docker compose --profile monitoring up -d
+#
+# Start with bridge:
+#   docker compose --profile bridge up -d
+#
+# Start everything:
+#   docker compose --profile monitoring --profile bridge --profile testing up -d
+#
+# View logs:
+#   docker compose logs -f svix-server
+#
+# Run CLI commands:
+#   docker compose exec svix-server svix --help
+#   docker compose exec svix-server svix-server jwt generate
+#
+# Connect to database:
+#   docker compose exec postgres psql -U postgres -d svix

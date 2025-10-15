@@ -1,0 +1,280 @@
+version: "3.8"
+
+networks:
+  svix-dev-network:
+    driver: bridge
+
+volumes:
+  postgres-dev-data:
+    driver: local
+  redis-dev-data:
+    driver: local
+  cargo-cache:
+    driver: local
+  target-cache:
+    driver: local
+
+services:
+  # Development PostgreSQL Database
+  postgres-dev:
+    image: "docker.io/postgres:13.4"
+    container_name: svix-postgres-dev
+    networks:
+      - svix-dev-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    volumes:
+      - "postgres-dev-data:/var/lib/postgresql/data/"
+    environment:
+      POSTGRES_DB: svix_dev
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_INITDB_ARGS: "--auth-host=trust --auth-local=trust"
+    ports:
+      - "5433:5432"
+
+  # Development Redis
+  redis-dev:
+    image: "docker.io/redis:7-alpine"
+    container_name: svix-redis-dev
+    networks:
+      - svix-dev-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+    command: >
+      --save 300 10
+      --appendonly yes
+      --appendfsync everysec
+      --maxmemory 256mb
+      --maxmemory-policy allkeys-lru
+    volumes:
+      - "redis-dev-data:/data"
+    ports:
+      - "6380:6379"
+
+  # Development Svix Server with hot reloading
+  svix-server-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: development
+    image: svix/svix-dev:latest
+    container_name: svix-server-dev
+    networks:
+      - svix-dev-network
+    environment:
+      # Database Configuration
+      SVIX_DB_DSN: "postgresql://postgres:postgres@postgres-dev:5432/svix_dev"
+      
+      # Redis Configuration
+      SVIX_REDIS_DSN: "redis://redis-dev:6379"
+      SVIX_QUEUE_TYPE: "redis"
+      
+      # Development JWT Secret
+      SVIX_JWT_SECRET: "development-secret-do-not-use-in-production"
+      
+      # Development Configuration
+      SVIX_LOG_LEVEL: "debug"
+      SVIX_LOG_FORMAT: "pretty"
+      
+      # Allow all local networks for development
+      SVIX_WHITELIST_SUBNETS: '["0.0.0.0/0"]'
+      
+      # Development performance settings
+      SVIX_DB_POOL_MAX_SIZE: "20"
+      SVIX_REDIS_POOL_MAX_SIZE: "20"
+      
+      # Rust development settings
+      RUST_BACKTRACE: "1"
+      RUST_LOG: "debug,sqlx=warn,hyper=warn"
+    volumes:
+      - ".:/app"
+      - "cargo-cache:/usr/local/cargo/registry"
+      - "target-cache:/app/target"
+    working_dir: /app/server
+    command: >
+      bash -c "
+        echo 'Installing cargo-watch for hot reloading...'
+        cargo install cargo-watch 2>/dev/null || true
+        echo 'Starting development server with hot reloading...'
+        cargo watch -x 'run --bin svix-server -- --run-migrations --wait-for 30'
+      "
+    ports:
+      - "8071:8071"
+      - "9229:9229"  # Debug port
+    depends_on:
+      postgres-dev:
+        condition: service_healthy
+      redis-dev:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # Development Bridge
+  svix-bridge-dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: development
+    image: svix/svix-dev:latest
+    container_name: svix-bridge-dev
+    networks:
+      - svix-dev-network
+    environment:
+      SVIX_BRIDGE_CFG: "/app/bridge/svix-bridge.example.senders.yaml"
+      RUST_BACKTRACE: "1"
+      RUST_LOG: "debug"
+    volumes:
+      - ".:/app"
+      - "cargo-cache:/usr/local/cargo/registry"
+      - "target-cache:/app/target"
+    working_dir: /app/bridge
+    command: >
+      bash -c "
+        echo 'Installing cargo-watch for hot reloading...'
+        cargo install cargo-watch 2>/dev/null || true
+        echo 'Starting development bridge with hot reloading...'
+        cargo watch -x 'run --bin svix-bridge'
+      "
+    ports:
+      - "5000:5000"
+    depends_on:
+      svix-server-dev:
+        condition: service_started
+    profiles:
+      - bridge
+
+  # Database Migration Runner
+  migrate:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: development
+    image: svix/svix-dev:latest
+    networks:
+      - svix-dev-network
+    environment:
+      SVIX_DB_DSN: "postgresql://postgres:postgres@postgres-dev:5432/svix_dev"
+    volumes:
+      - ".:/app"
+    working_dir: /app/server
+    command: ["cargo", "run", "--bin", "svix-server", "--", "--run-migrations"]
+    depends_on:
+      postgres-dev:
+        condition: service_healthy
+    profiles:
+      - tools
+
+  # Test Runner
+  test:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: development
+    image: svix/svix-dev:latest
+    networks:
+      - svix-dev-network
+    environment:
+      SVIX_DB_DSN: "postgresql://postgres:postgres@postgres-dev:5432/svix_dev"
+      SVIX_REDIS_DSN: "redis://redis-dev:6379"
+      RUST_BACKTRACE: "1"
+    volumes:
+      - ".:/app"
+      - "cargo-cache:/usr/local/cargo/registry"
+      - "target-cache:/app/target"
+    working_dir: /app
+    command: ["cargo", "test", "--workspace"]
+    depends_on:
+      postgres-dev:
+        condition: service_healthy
+      redis-dev:
+        condition: service_healthy
+    profiles:
+      - testing
+
+  # Development Tools Container
+  dev-tools:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      target: development
+    image: svix/svix-dev:latest
+    container_name: svix-dev-tools
+    networks:
+      - svix-dev-network
+    environment:
+      SVIX_DB_DSN: "postgresql://postgres:postgres@postgres-dev:5432/svix_dev"
+      SVIX_REDIS_DSN: "redis://redis-dev:6379"
+    volumes:
+      - ".:/app"
+      - "cargo-cache:/usr/local/cargo/registry"
+      - "target-cache:/app/target"
+    working_dir: /app
+    command: ["tail", "-f", "/dev/null"]
+    profiles:
+      - tools
+
+  # Redis Commander for development
+  redis-commander-dev:
+    image: docker.io/rediscommander/redis-commander:latest
+    container_name: svix-redis-ui-dev
+    networks:
+      - svix-dev-network
+    environment:
+      REDIS_HOSTS: "dev:redis-dev:6379"
+      HTTP_USER: dev
+      HTTP_PASSWORD: dev
+    ports:
+      - "8081:8081"
+    depends_on:
+      redis-dev:
+        condition: service_healthy
+    profiles:
+      - monitoring
+
+  # PgAdmin for development
+  pgadmin-dev:
+    image: docker.io/dpage/pgadmin4:latest
+    container_name: svix-pgadmin-dev
+    networks:
+      - svix-dev-network
+    environment:
+      PGADMIN_DEFAULT_EMAIL: dev@svix.local
+      PGADMIN_DEFAULT_PASSWORD: dev
+      PGADMIN_CONFIG_SERVER_MODE: 'False'
+    ports:
+      - "8080:80"
+    depends_on:
+      postgres-dev:
+        condition: service_healthy
+    profiles:
+      - monitoring
+
+# Development usage examples:
+# 
+# Start core development services:
+#   docker compose -f docker-compose.dev.yml up -d
+# 
+# Start with monitoring:
+#   docker compose -f docker-compose.dev.yml --profile monitoring up -d
+#
+# Run tests:
+#   docker compose -f docker-compose.dev.yml --profile testing up test
+#
+# Run migrations:
+#   docker compose -f docker-compose.dev.yml --profile tools up migrate
+#
+# Access dev tools container:
+#   docker compose -f docker-compose.dev.yml --profile tools up -d dev-tools
+#   docker compose -f docker-compose.dev.yml exec dev-tools bash
+#
+# View development logs:
+#   docker compose -f docker-compose.dev.yml logs -f svix-server-dev
+#
+# Rebuild and restart:
+#   docker compose -f docker-compose.dev.yml up --build -d
